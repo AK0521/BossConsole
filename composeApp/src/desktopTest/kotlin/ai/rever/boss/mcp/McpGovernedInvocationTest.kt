@@ -1,5 +1,6 @@
 package ai.rever.boss.mcp
 
+import ai.rever.boss.mcp.sandbox.McpRiskLevel
 import ai.rever.boss.plugin.api.McpToolDefinition
 import ai.rever.boss.plugin.api.McpToolHandler
 import ai.rever.boss.plugin.api.McpToolProvider
@@ -8,10 +9,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -309,6 +312,244 @@ class McpGovernedInvocationTest {
                 McpApprovalDisposition.AUTO_ALLOWED,
                 ledger.recentOperations.value
                     .first()
+                    .approvalDisposition,
+            )
+        }
+
+    @Test
+    fun `standing ALLOW re-asks for argument-sensitive critical risk`() =
+        runBlocking {
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            val policyEngine = McpPolicyEngine(policyFile = null)
+            val ledger = McpOperationLedger(ledgerFile = null)
+            var callCount = 0
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = null,
+                    policyEngine = policyEngine,
+                    approvalBus = approvalBus,
+                    ledger = ledger,
+                )
+            policyEngine.setToolPolicy("run_command", McpPolicyAction.ALLOW)
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        "run_command",
+                        handler =
+                            McpToolHandler {
+                                callCount++
+                                McpToolResult("ran")
+                            },
+                    ),
+                ),
+            )
+
+            val call = async { core.invoke("run_command", """{"command":"rm -rf /tmp/test"}""") }
+            val request =
+                withTimeoutOrNull(500L) {
+                    approvalBus.pendingList
+                        .first { it.isNotEmpty() }
+                        .single()
+                }
+
+            assertEquals(0, callCount, "critical call must wait for fresh approval before executing")
+            val approvalRequest =
+                assertNotNull(
+                    request,
+                    "argument-sensitive CRITICAL risk should queue a fresh approval even under standing ALLOW",
+                )
+            assertEquals("run_command", approvalRequest.toolName)
+            assertEquals("terminal-tab", approvalRequest.providerId)
+            assertEquals(McpRiskLevel.CRITICAL, approvalRequest.riskAssessment?.level)
+
+            approvalBus.approve(approvalRequest.id)
+            val result = call.await()
+
+            assertFalse(result.isError)
+            assertEquals("ran", result.text)
+            assertEquals(1, callCount)
+            assertEquals(1L, ledger.totalCalls.value)
+            val operation =
+                ledger.recentOperations.value
+                    .single()
+            assertEquals(McpPolicyAction.ALLOW, operation.policyApplied)
+            assertEquals(McpApprovalDisposition.APPROVED_ONCE, operation.approvalDisposition)
+        }
+
+    @Test
+    fun `standing ALLOW still auto-allows non-critical invocation`() =
+        runBlocking {
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            val policyEngine = McpPolicyEngine(policyFile = null)
+            val ledger = McpOperationLedger(ledgerFile = null)
+            var callCount = 0
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = null,
+                    policyEngine = policyEngine,
+                    approvalBus = approvalBus,
+                    ledger = ledger,
+                )
+            policyEngine.setToolPolicy("run_command", McpPolicyAction.ALLOW)
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        "run_command",
+                        handler =
+                            McpToolHandler {
+                                callCount++
+                                McpToolResult("ran")
+                            },
+                    ),
+                ),
+            )
+
+            val result = withTimeoutOrNull(500L) { core.invoke("run_command", """{"command":"ls -la"}""") }
+
+            val completed = assertNotNull(result, "non-critical standing ALLOW should not wait for approval")
+            assertFalse(completed.isError)
+            assertEquals("ran", completed.text)
+            assertEquals(1, callCount)
+            assertTrue(approvalBus.pendingList.value.isEmpty(), "non-critical standing ALLOW should not queue approval")
+            assertEquals(1L, ledger.totalCalls.value)
+            assertEquals(
+                McpApprovalDisposition.AUTO_ALLOWED,
+                ledger.recentOperations.value
+                    .single()
+                    .approvalDisposition,
+            )
+        }
+
+    @Test
+    fun `provider trust still auto-allows non-critical invocation`() =
+        runBlocking {
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            val policyEngine = McpPolicyEngine(policyFile = null)
+            val ledger = McpOperationLedger(ledgerFile = null)
+            var callCount = 0
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = null,
+                    policyEngine = policyEngine,
+                    approvalBus = approvalBus,
+                    ledger = ledger,
+                )
+            policyEngine.setProviderPolicy("terminal-tab", McpPolicyAction.ALLOW)
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        "run_command",
+                        handler =
+                            McpToolHandler {
+                                callCount++
+                                McpToolResult("ran")
+                            },
+                    ),
+                ),
+            )
+
+            val result = withTimeoutOrNull(500L) { core.invoke("run_command", """{"command":"ls -la"}""") }
+
+            val completed = assertNotNull(result, "non-critical provider trust should not wait for approval")
+            assertFalse(completed.isError)
+            assertEquals("ran", completed.text)
+            assertEquals(1, callCount)
+            assertTrue(approvalBus.pendingList.value.isEmpty(), "non-critical provider trust should not queue approval")
+            assertEquals(
+                McpApprovalDisposition.AUTO_ALLOWED,
+                ledger.recentOperations.value
+                    .single()
+                    .approvalDisposition,
+            )
+        }
+
+    @Test
+    fun `session trust still auto-allows non-critical invocation`() =
+        runBlocking {
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            val policyEngine = McpPolicyEngine(policyFile = null)
+            val ledger = McpOperationLedger(ledgerFile = null)
+            var callCount = 0
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = null,
+                    policyEngine = policyEngine,
+                    approvalBus = approvalBus,
+                    ledger = ledger,
+                )
+            policyEngine.trustForSession("run_command")
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        "run_command",
+                        handler =
+                            McpToolHandler {
+                                callCount++
+                                McpToolResult("ran")
+                            },
+                    ),
+                ),
+            )
+
+            val result = withTimeoutOrNull(500L) { core.invoke("run_command", """{"command":"ls -la"}""") }
+
+            val completed = assertNotNull(result, "non-critical session trust should not wait for approval")
+            assertFalse(completed.isError)
+            assertEquals("ran", completed.text)
+            assertEquals(1, callCount)
+            assertTrue(approvalBus.pendingList.value.isEmpty(), "non-critical session trust should not queue approval")
+            assertEquals(
+                McpApprovalDisposition.AUTO_ALLOWED,
+                ledger.recentOperations.value
+                    .single()
+                    .approvalDisposition,
+            )
+        }
+
+    @Test
+    fun `DENY still rejects critical invocation without approval`() =
+        runBlocking {
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            val policyEngine = McpPolicyEngine(policyFile = null)
+            val ledger = McpOperationLedger(ledgerFile = null)
+            var callCount = 0
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = null,
+                    policyEngine = policyEngine,
+                    approvalBus = approvalBus,
+                    ledger = ledger,
+                )
+            policyEngine.setToolPolicy("run_command", McpPolicyAction.DENY)
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        "run_command",
+                        handler =
+                            McpToolHandler {
+                                callCount++
+                                McpToolResult("ran")
+                            },
+                    ),
+                ),
+            )
+
+            val result = core.invoke("run_command", """{"command":"rm -rf /tmp/test"}""")
+
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("rejected by policy"))
+            assertEquals(0, callCount)
+            assertTrue(approvalBus.pendingList.value.isEmpty(), "DENY should not queue approval")
+            assertEquals(1L, ledger.totalErrors.value)
+            assertEquals(
+                McpApprovalDisposition.POLICY_DENIED,
+                ledger.recentOperations.value
+                    .single()
                     .approvalDisposition,
             )
         }

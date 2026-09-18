@@ -2,6 +2,7 @@ package ai.rever.boss.mcp
 
 import ai.rever.boss.components.bars.horizontal.StatusMessageManager
 import ai.rever.boss.mcp.sandbox.DefaultMcpRiskEvaluator
+import ai.rever.boss.mcp.sandbox.McpRiskLevel
 import ai.rever.boss.plugin.api.McpToolArgs
 import ai.rever.boss.plugin.api.McpToolDefinition
 import ai.rever.boss.plugin.api.McpToolProvider
@@ -960,41 +961,44 @@ internal class McpToolRegistryCore(
                 McpApprovalDisposition.POLICY_DENIED to "MCP tool rejected by policy (DENY)"
             }
 
-            McpPolicyAction.ALLOW -> {
-                McpApprovalDisposition.AUTO_ALLOWED to null
-            }
+            McpPolicyAction.ALLOW,
+            McpPolicyAction.ASK,
+            -> {
+                val riskAssessment = DefaultMcpRiskEvaluator().evaluateRisk(tool.definition.name, args)
+                if (policy == McpPolicyAction.ALLOW && riskAssessment.level != McpRiskLevel.CRITICAL) {
+                    McpApprovalDisposition.AUTO_ALLOWED to null
+                } else {
+                    when (
+                        val decision =
+                            approvalBus.requestApproval(
+                                tool.definition.name,
+                                tool.providerId,
+                                McpArgumentSanitizer.parseArguments(args.raw),
+                                riskAssessment = riskAssessment,
+                                declaredReadOnly = tool.definition.readOnly,
+                            )
+                    ) {
+                        is McpApprovalDecision.Approved -> {
+                            approvedAuthorization(tool, decision, revocation)
+                        }
 
-            McpPolicyAction.ASK -> {
-                when (
-                    val decision =
-                        approvalBus.requestApproval(
-                            tool.definition.name,
-                            tool.providerId,
-                            McpArgumentSanitizer.parseArguments(args.raw),
-                            riskAssessment = DefaultMcpRiskEvaluator().evaluateRisk(tool.definition.name, args),
-                            declaredReadOnly = tool.definition.readOnly,
-                        )
-                ) {
-                    is McpApprovalDecision.Approved -> {
-                        approvedAuthorization(tool, decision, revocation)
-                    }
+                        is McpApprovalDecision.Denied -> {
+                            val disposition =
+                                if (decision.persistPolicy) {
+                                    persistentDenialDisposition(tool, revocation)
+                                } else {
+                                    McpApprovalDisposition.DENIED_BY_OPERATOR
+                                }
+                            disposition to "MCP tool rejected by operator: ${decision.reason}"
+                        }
 
-                    is McpApprovalDecision.Denied -> {
-                        val disposition =
-                            if (decision.persistPolicy) {
-                                persistentDenialDisposition(tool, revocation)
-                            } else {
-                                McpApprovalDisposition.DENIED_BY_OPERATOR
-                            }
-                        disposition to "MCP tool rejected by operator: ${decision.reason}"
-                    }
+                        McpApprovalDecision.QueueFull -> {
+                            McpApprovalDisposition.QUEUE_FULL to "MCP approval queue is full; no operator decision was made"
+                        }
 
-                    McpApprovalDecision.QueueFull -> {
-                        McpApprovalDisposition.QUEUE_FULL to "MCP approval queue is full; no operator decision was made"
-                    }
-
-                    McpApprovalDecision.Timeout -> {
-                        McpApprovalDisposition.TIMEOUT to "MCP tool timed out waiting for operator approval"
+                        McpApprovalDecision.Timeout -> {
+                            McpApprovalDisposition.TIMEOUT to "MCP tool timed out waiting for operator approval"
+                        }
                     }
                 }
             }
